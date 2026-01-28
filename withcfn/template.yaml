@@ -1,0 +1,431 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for deploying atomicAqua agent to Amazon Bedrock AgentCore'
+
+Parameters:
+  AgentRuntimeName:
+    Type: String
+    Default: 'aqua_agent_v1'
+    Description: Name for the AgentCore runtime (alphanumeric and underscores only)
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,47}$'
+    
+  MemoryName:
+    Type: String
+    Default: 'aqua_memory_v1'
+    Description: Name for the AgentCore Memory resource (alphanumeric and underscores only)
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,47}$'
+    
+  ECRRepositoryName:
+    Type: String
+    Default: 'aqua_agent_v1'
+    Description: ECR repository name (lowercase, managed outside CloudFormation)
+    
+  MemoryEventExpiryDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days before memory events expire
+    
+  EnvironmentType:
+    Type: String
+    Default: 'production'
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment type for tagging
+    
+  ContainerImageUri:
+    Type: String
+    Description: ECR container image URI for the agent (e.g., 123456789.dkr.ecr.region.amazonaws.com/repo:tag)
+
+Resources:
+  # ============================================
+  # AgentCore Memory
+  # ============================================
+  
+  AgentCoreMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Properties:
+      Name: !Ref MemoryName
+      Description: !Sub 'Memory for ${AgentRuntimeName} agent'
+      EventExpiryDuration: !Ref MemoryEventExpiryDays
+
+  # ============================================
+  # IAM Role for AgentCore Runtime
+  # ============================================
+
+  AgentCoreExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AgentRuntimeName}_execution_role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - bedrock-agentcore.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref AgentCoreExecutionPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Application
+          Value: !Ref AgentRuntimeName
+
+  AgentCoreExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AgentRuntimeName}_execution_policy'
+      Description: Permissions for AgentCore runtime to invoke Bedrock models and access memory
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockModelAccess
+            Effect: Allow
+            Action:
+              - 'bedrock:InvokeModel'
+              - 'bedrock:InvokeModelWithResponseStream'
+              - 'bedrock:ConverseStream'
+              - 'bedrock:Converse'
+            Resource:
+              - 'arn:aws:bedrock:*::foundation-model/*'
+              - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+          
+          - Sid: AgentCoreMemoryAccess
+            Effect: Allow
+            Action:
+              - 'bedrock-agentcore:*Memory*'
+              - 'bedrock-agentcore:*Event*'
+            Resource:
+              - !GetAtt AgentCoreMemory.MemoryArn
+          
+          - Sid: ECRAccess
+            Effect: Allow
+            Action:
+              - 'ecr:GetDownloadUrlForLayer'
+              - 'ecr:BatchGetImage'
+              - 'ecr:BatchCheckLayerAvailability'
+            Resource:
+              - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepositoryName}'
+          
+          - Sid: ECRAuthAccess
+            Effect: Allow
+            Action:
+              - 'ecr:GetAuthorizationToken'
+            Resource: '*'
+          
+          - Sid: CloudWatchLogsAccess
+            Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource:
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*'
+
+  # ============================================
+  # Cognito User Pool for JWT Auth
+  # ============================================
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AgentRuntimeName}_users'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      UserPoolTags:
+        Environment: !Ref EnvironmentType
+        Application: !Ref AgentRuntimeName
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${AgentRuntimeName}_client'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - 'http://localhost:3000/callback'
+      LogoutURLs:
+        - 'http://localhost:3000/logout'
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'aqua-agent-${AWS::AccountId}'
+      UserPoolId: !Ref CognitoUserPool
+
+  # ============================================
+  # AgentCore Runtime (JWT Auth via Cognito)
+  # ============================================
+
+  AgentCoreRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn:
+      - AgentCoreExecutionRole
+      - AgentCoreMemory
+      - CognitoUserPool
+      - CognitoUserPoolClient
+    Properties:
+      AgentRuntimeName: !Ref AgentRuntimeName
+      RoleArn: !GetAtt AgentCoreExecutionRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref ContainerImageUri
+      EnvironmentVariables:
+        MEMORY_ID: !GetAtt AgentCoreMemory.MemoryId
+        AWS_REGION: !Ref AWS::Region
+        ENVIRONMENT: !Ref EnvironmentType
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      ProtocolConfiguration: HTTP
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}/.well-known/openid-configuration'
+          AllowedClients:
+            - !Ref CognitoUserPoolClient
+
+  AgentCoreRuntimeEndpoint:
+    Type: AWS::BedrockAgentCore::RuntimeEndpoint
+    DependsOn: AgentCoreRuntime
+    Properties:
+      AgentRuntimeId: !GetAtt AgentCoreRuntime.AgentRuntimeId
+      AgentRuntimeVersion: '1'
+      Name: !Sub '${AgentRuntimeName}_endpoint'
+      Description: !Sub 'HTTP endpoint for ${AgentRuntimeName} agent'
+
+  # ============================================
+  # API Gateway REST API (JWT Auth, Streaming)
+  # ============================================
+
+  AgentRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AgentRuntimeName}_api'
+      Description: !Sub 'Public streaming API for ${AgentRuntimeName} agent'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentType
+        - Key: Application
+          Value: !Ref AgentRuntimeName
+
+  InvokeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AgentRestApi
+      ParentId: !GetAtt AgentRestApi.RootResourceId
+      PathPart: invoke
+
+  # IAM Role for API Gateway to call AgentCore
+  ApiGatewayAgentCoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AgentRuntimeName}_apigw_role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeAgentCore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeRuntime
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${AgentCoreRuntime.AgentRuntimeId}'
+
+  # POST /invoke - No auth required, streaming enabled
+  InvokeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AgentRestApi
+      ResourceId: !Ref InvokeResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'https://bedrock-agentcore.${AWS::Region}.amazonaws.com/runtimes/${AgentCoreRuntime.AgentRuntimeId}/invocations?qualifier=DEFAULT&accountId=${AWS::AccountId}'
+        Credentials: !GetAtt ApiGatewayAgentCoreRole.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        ResponseTransferMode: STREAM
+        TimeoutInMillis: 900000
+        IntegrationResponses:
+          - StatusCode: '200'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: Empty
+
+  # OPTIONS for CORS
+  InvokeOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AgentRestApi
+      ResourceId: !Ref InvokeResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - InvokeMethod
+      - InvokeOptionsMethod
+    Properties:
+      RestApiId: !Ref AgentRestApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod
+      RestApiId: !Ref AgentRestApi
+      DeploymentId: !Ref ApiDeployment
+      Description: Production stage with streaming enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentType
+
+Outputs:
+  MemoryId:
+    Description: ID of the AgentCore Memory
+    Value: !GetAtt AgentCoreMemory.MemoryId
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryId'
+      
+  MemoryArn:
+    Description: ARN of the AgentCore Memory
+    Value: !GetAtt AgentCoreMemory.MemoryArn
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryArn'
+
+  ECRRepositoryUri:
+    Description: ECR Repository URI for pushing agent images
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepositoryName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepositoryUri'
+
+  ExecutionRoleArn:
+    Description: ARN of the AgentCore execution role
+    Value: !GetAtt AgentCoreExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
+
+  AgentRuntimeId:
+    Description: ID of the AgentCore Runtime
+    Value: !GetAtt AgentCoreRuntime.AgentRuntimeId
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentRuntimeId'
+
+  AgentRuntimeArn:
+    Description: ARN of the AgentCore Runtime
+    Value: !GetAtt AgentCoreRuntime.AgentRuntimeArn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentRuntimeArn'
+
+  RuntimeEndpointId:
+    Description: ID of the Runtime Endpoint
+    Value: !GetAtt AgentCoreRuntimeEndpoint.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-RuntimeEndpointId'
+
+  RuntimeEndpointArn:
+    Description: ARN of the Runtime Endpoint
+    Value: !GetAtt AgentCoreRuntimeEndpoint.AgentRuntimeEndpointArn
+    Export:
+      Name: !Sub '${AWS::StackName}-RuntimeEndpointArn'
+
+  # API Gateway Outputs
+  ApiEndpoint:
+    Description: Public API endpoint URL for invoking the agent (with streaming)
+    Value: !Sub 'https://${AgentRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/invoke'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  ApiGatewayId:
+    Description: API Gateway REST API ID
+    Value: !Ref AgentRestApi
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayId'
+
+  # Cognito Outputs
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoUserPoolId'
+
+  CognitoUserPoolClientId:
+    Description: Cognito User Pool Client ID (use this for authentication)
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoUserPoolClientId'
+
+  CognitoHostedUIUrl:
+    Description: Cognito Hosted UI URL for login
+    Value: !Sub 'https://aqua-agent-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${CognitoUserPoolClient}&response_type=token&scope=openid+email+profile&redirect_uri=http://localhost:3000/callback'
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoHostedUIUrl'
+
+  CognitoTokenUrl:
+    Description: Cognito Token endpoint for programmatic auth
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoTokenUrl'
